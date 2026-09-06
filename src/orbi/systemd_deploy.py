@@ -4,8 +4,9 @@ The repo templates ``systemd/orbi@.service`` and
 ``systemd/orbi@.timer`` are the single source of truth for the
 user-level units. This module provides:
 
-- an idempotent install (overwrite-copy the templates into the user
-  unit directory, ``systemctl --user daemon-reload``, enable timer
+- an idempotent install (copy the templates into the user unit
+  directory after confirming an existing deployment uses the same
+  config, ``systemctl --user daemon-reload``, enable timer
   instances through the configured ``max_concurrency`` and disable
   surplus timers) that NEVER starts/stops/restarts the service: a currently running
   Runner keeps running, and the new config takes effect at the next
@@ -26,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 from pathlib import Path
 
 from orbi.pi_activity import quote_value
@@ -78,6 +80,44 @@ FIX_COMMAND = "orbi install-units"
 
 class UnitDriftError(RuntimeError):
     """The installed units have drifted from the repo templates."""
+
+
+class UnitConflictError(RuntimeError):
+    """An existing unit belongs to a different deployment checkout."""
+
+
+def installed_config(unit_path: Path) -> Path | None:
+    """Return the ORBI_CONFIG value from an installed service unit."""
+    if not unit_path.is_file():
+        return None
+    text = unit_path.read_text(encoding="utf-8")
+    match = re.search(
+        r"\bORBI_CONFIG=(?:\"([^\"]+)\"|([^\s\"]+))", text,
+    )
+    if match is None:
+        return None
+    return Path(match.group(1) or match.group(2)).expanduser().resolve()
+
+
+def reject_different_deployment(repo_dir: Path, installed_dir: Path) -> None:
+    """Refuse to overwrite units owned by another checkout."""
+    existing = installed_config(installed_dir / SERVICE_UNIT)
+    if existing is None:
+        return
+    expected = (Path(repo_dir).resolve() / "orbi.toml").resolve()
+    if existing == expected:
+        return
+    message = (
+        "existing systemd deployment points at a different ORBI_CONFIG: "
+        f"{existing} (this checkout uses {expected}); uninstall the existing "
+        "deployment before installing this checkout"
+    )
+    LOGGER.error(
+        "unit_conflict unit=%s installed_config=%s expected_config=%s "
+        "action=uninstall_existing_deployment",
+        SERVICE_UNIT, existing, expected,
+    )
+    raise UnitConflictError(message)
 
 
 def repo_unit_dir(repo_dir: Path) -> Path:
@@ -344,7 +384,9 @@ def install_units(repo_dir: Path, installed_dir: Path | None = None,
     """Idempotently install the repo templates as the user units.
 
     Overwrites BOTH installed template units with the repo templates
-    (the repo is the single source of truth), migrates the pre-#149
+    (the repo is the single source of truth), unless the installed
+    service belongs to a different config, which fails before any
+    migration or write. Migrates the pre-#149
     non-templated units away once (see ``migrate_legacy_units``), runs
     ``systemctl --user daemon-reload``, enables instances through
     ``max_concurrency`` and disables surplus timers. These operations
@@ -363,6 +405,7 @@ def install_units(repo_dir: Path, installed_dir: Path | None = None,
     if installed_dir is None:
         installed_dir = installed_unit_dir()
     installed_dir = Path(installed_dir)
+    reject_different_deployment(repo_dir, installed_dir)
     for name in UNIT_NAMES:
         template = repo_unit_dir(repo_dir) / name
         if not template.is_file():

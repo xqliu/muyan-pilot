@@ -242,6 +242,65 @@ def test_check_unit_drift_uses_the_default_installed_dir(monkeypatch,
     systemd_deploy.check_unit_drift(repo)  # clean: must not raise
 
 
+def test_install_units_rejects_an_existing_deployment_for_another_config(
+    tmp_path, caplog,
+):
+    """A second checkout must not silently take ownership of the units."""
+    first_repo = make_repo(tmp_path / "first")
+    second_repo = make_repo(tmp_path / "second")
+    for repo in (first_repo, second_repo):
+        (repo / "systemd" / "orbi@.service").write_text(
+            '[Service]\nEnvironment="ORBI_CONFIG='
+            '{{ORBI_REPO_DIR}}/orbi.toml"\n',
+            encoding="utf-8",
+        )
+    installed = tmp_path / "install"
+    systemd_deploy.install_units(
+        first_repo, installed, run_command=lambda command, **kwargs: "",
+    )
+    before = {
+        name: (installed / name).read_bytes()
+        for name in systemd_deploy.UNIT_NAMES
+    }
+
+    with caplog.at_level("ERROR"):
+        with pytest.raises(
+            systemd_deploy.UnitConflictError,
+            match="different ORBI_CONFIG.*uninstall",
+        ):
+            systemd_deploy.install_units(
+                second_repo, installed,
+                run_command=lambda command, **kwargs: pytest.fail(
+                    "conflicting install must stop before systemctl"
+                ),
+            )
+
+    assert {
+        name: (installed / name).read_bytes()
+        for name in systemd_deploy.UNIT_NAMES
+    } == before
+    assert "unit_conflict" in caplog.text
+
+
+def test_install_units_allows_reinstall_for_the_same_config(tmp_path):
+    repo = make_repo(tmp_path)
+    (repo / "systemd" / "orbi@.service").write_text(
+        '[Service]\nEnvironment="ORBI_CONFIG='
+        '{{ORBI_REPO_DIR}}/orbi.toml"\n',
+        encoding="utf-8",
+    )
+    installed = tmp_path / "install"
+    systemd_deploy.install_units(
+        repo, installed, run_command=lambda command, **kwargs: "",
+    )
+    systemd_deploy.install_units(
+        repo, installed, run_command=lambda command, **kwargs: "",
+    )
+    assert systemd_deploy.installed_config(
+        installed / "orbi@.service",
+    ) == repo.resolve() / "orbi.toml"
+
+
 def test_install_units_copies_templates_and_reloads(monkeypatch, tmp_path):
     repo = make_repo(tmp_path)
     installed = tmp_path / "install"
